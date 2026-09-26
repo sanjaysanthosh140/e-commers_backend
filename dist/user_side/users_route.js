@@ -14,4 +14,5 @@ Router.post("/cart/add", auth_middleware_1.authMiddleware, cart_controller_1.add
 Router.get("/cart", auth_middleware_1.authMiddleware, cart_controller_1.get_cart);
 Router.patch("/cart/qty", auth_middleware_1.authMiddleware, cart_controller_1.cart_qty_action);
 Router.delete("/cart/item", auth_middleware_1.authMiddleware, cart_controller_1.remove_from_cart);
+Router.post("/cart/checkout", auth_middleware_1.authMiddleware, cart_controller_1.checkout_cart);
 exports.default = Router;

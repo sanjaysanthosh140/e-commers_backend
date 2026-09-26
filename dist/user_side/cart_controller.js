@@ -12,14 +12,64 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.remove_from_cart = exports.cart_qty_action = exports.get_cart = exports.add_to_cart = void 0;
+exports.checkout_cart = exports.remove_from_cart = exports.cart_qty_action = exports.get_cart = exports.add_to_cart = void 0;
 const cart_1 = __importDefault(require("../mongo_db/Schemas/cart"));
 const product_1 = __importDefault(require("../mongo_db/Schemas/product"));
-const findVariant = (product, variantId) => {
-    var _a, _b;
-    return ((_b = (_a = product.variants).id) === null || _b === void 0 ? void 0 : _b.call(_a, variantId)) ||
-        product.variants.find((v) => String(v._id) === String(variantId));
-};
+const order_1 = __importDefault(require("../mongo_db/Schemas/order"));
+const stock_1 = require("./stock");
+const enrichCartItems = (...args_1) => __awaiter(void 0, [...args_1], void 0, function* (items = []) {
+    let hasBlockingIssues = false;
+    const enriched = yield Promise.all(items.map((item) => __awaiter(void 0, void 0, void 0, function* () {
+        var _a;
+        const product = yield product_1.default.findById(item.productId);
+        const variant = product ? (0, stock_1.findVariant)(product, String(item.variantId)) : null;
+        const qty = Number(item.quantity) || 1;
+        const price = variant ? Number(variant.price) : Number(item.price) || 0;
+        const availableStock = variant ? Number(variant.stock) || 0 : 0;
+        let availability = "ok";
+        let issue = "";
+        if (!product || !variant) {
+            availability = "missing";
+            issue = "This product is no longer available.";
+            hasBlockingIssues = true;
+        }
+        else if (availableStock <= 0) {
+            availability = "out_of_stock";
+            issue = "Out of stock — remove this item before checkout.";
+            hasBlockingIssues = true;
+        }
+        else if (qty > availableStock) {
+            availability = "limited";
+            issue = `Only ${availableStock} left. Reduce quantity before checkout.`;
+            hasBlockingIssues = true;
+        }
+        return {
+            productId: item.productId,
+            variantId: item.variantId,
+            sku: item.sku || (variant === null || variant === void 0 ? void 0 : variant.sku) || "",
+            title: item.title || (product === null || product === void 0 ? void 0 : product.title) || "Unknown product",
+            size: item.size || (variant === null || variant === void 0 ? void 0 : variant.size) || "",
+            colour: item.colour || (variant === null || variant === void 0 ? void 0 : variant.colour) || "",
+            price,
+            quantity: qty,
+            image: item.image || (variant === null || variant === void 0 ? void 0 : variant.image) || ((_a = product === null || product === void 0 ? void 0 : product.images) === null || _a === void 0 ? void 0 : _a[0]) || "",
+            availableStock,
+            availability,
+            issue,
+            lineTotal: availability === "ok" ? price * qty : 0,
+        };
+    })));
+    const subtotal = enriched
+        .filter((i) => i.availability === "ok")
+        .reduce((sum, i) => sum + i.price * i.quantity, 0);
+    return {
+        items: enriched,
+        subtotal,
+        canCheckout: !hasBlockingIssues && enriched.length > 0,
+        hasBlockingIssues,
+    };
+});
+/** Soft cart: add without decrementing stock. Stock is claimed only at checkout. */
 const add_to_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b;
     try {
@@ -38,7 +88,7 @@ const add_to_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         if (!product) {
             return res.status(404).json({ message: "Product not found" });
         }
-        const variant = findVariant(product, variantId);
+        const variant = (0, stock_1.findVariant)(product, variantId);
         if (!variant) {
             return res.status(404).json({ message: "Variant not found" });
         }
@@ -76,16 +126,11 @@ const add_to_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                 image: variant.image || ((_a = product.images) === null || _a === void 0 ? void 0 : _a[0]) || "",
                 quantity: qty,
             });
-            variant.stock -= qty;
-            yield product.save();
             yield cart.save();
-            return res.status(200).json({
-                message: "New item added to your cart",
-                cart,
-                stock: variant.stock,
-            });
+            const summary = yield enrichCartItems(cart.items);
+            return res.status(200).json(Object.assign(Object.assign({ message: "New item added to your cart", cart }, summary), { stock: variant.stock }));
         }
-        const newCart = new cart_1.default({
+        const newCart = yield cart_1.default.create({
             userId,
             items: [
                 {
@@ -101,14 +146,8 @@ const add_to_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                 },
             ],
         });
-        variant.stock -= qty;
-        yield product.save();
-        yield newCart.save();
-        return res.status(201).json({
-            message: "Congrats, your cart is created",
-            cart: newCart,
-            stock: variant.stock,
-        });
+        const summary = yield enrichCartItems(newCart.items);
+        return res.status(201).json(Object.assign(Object.assign({ message: "Congrats, your cart is created", cart: newCart }, summary), { stock: variant.stock }));
     }
     catch (error) {
         return res.status(500).json({
@@ -118,13 +157,12 @@ const add_to_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
     }
 });
 exports.add_to_cart = add_to_cart;
+/** Returns cart with live stock status so stale items are visible before checkout. */
 const get_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const cart = yield cart_1.default.findOne({ userId: req.userId });
-        return res.status(200).json({
-            cart: cart || { userId: req.userId, items: [] },
-            items: (cart === null || cart === void 0 ? void 0 : cart.items) || [],
-        });
+        const summary = yield enrichCartItems((cart === null || cart === void 0 ? void 0 : cart.items) || []);
+        return res.status(200).json(Object.assign({ cart: cart || { userId: req.userId, items: [] } }, summary));
     }
     catch (error) {
         return res.status(500).json({
@@ -135,6 +173,7 @@ const get_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
 });
 exports.get_cart = get_cart;
 const cart_qty_action = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const userId = req.userId;
         const { productId, variantId, action } = req.body;
@@ -158,43 +197,34 @@ const cart_qty_action = (req, res) => __awaiter(void 0, void 0, void 0, function
         if (cartIndex === -1) {
             return res.status(404).json({ message: "Item not found in cart" });
         }
-        const variant = findVariant(product, variantId);
+        const variant = (0, stock_1.findVariant)(product, variantId);
         if (!variant) {
             return res.status(404).json({ message: "Variant not found" });
         }
         const cartItem = cart.items[cartIndex];
         if (action === "increment") {
-            if (!variant.stock || variant.stock <= 0) {
+            if (cartItem.quantity + 1 > (variant.stock || 0)) {
                 return res.status(400).json({
-                    message: "This product is out of stock. Cannot add more.",
-                    outOfStock: true,
-                    cart,
+                    message: variant.stock > 0
+                        ? `Only ${variant.stock} left in stock`
+                        : "This product is out of stock. Cannot add more.",
+                    outOfStock: !variant.stock || variant.stock <= 0,
+                    stock: variant.stock,
                     quantity: cartItem.quantity,
                 });
             }
             cartItem.quantity += 1;
-            variant.stock -= 1;
+        }
+        else if (cartItem.quantity === 1) {
+            cart.items.splice(cartIndex, 1);
         }
         else {
-            if (cartItem.quantity === 1) {
-                cart.items.splice(cartIndex, 1);
-                variant.stock += 1;
-            }
-            else {
-                cartItem.quantity -= 1;
-                variant.stock += 1;
-            }
+            cartItem.quantity -= 1;
         }
-        yield product.save();
         yield cart.save();
-        const updatedItem = cart.items.find((p) => String(p.productId) === String(productId) &&
-            String(p.variantId) === String(variantId));
-        return res.status(200).json({
-            message: action === "increment" ? "Quantity increased" : "Quantity decreased",
-            cart,
-            stock: variant.stock,
-            quantity: (updatedItem === null || updatedItem === void 0 ? void 0 : updatedItem.quantity) || 0,
-        });
+        const summary = yield enrichCartItems(cart.items);
+        return res.status(200).json(Object.assign(Object.assign({ message: action === "increment" ? "Quantity increased" : "Quantity decreased", cart }, summary), { stock: variant.stock, quantity: ((_a = cart.items.find((p) => String(p.productId) === String(productId) &&
+                String(p.variantId) === String(variantId))) === null || _a === void 0 ? void 0 : _a.quantity) || 0 }));
     }
     catch (error) {
         return res.status(500).json({
@@ -222,21 +252,10 @@ const remove_from_cart = (req, res) => __awaiter(void 0, void 0, void 0, functio
         if (cartIndex === -1) {
             return res.status(404).json({ message: "Item not found in cart" });
         }
-        const removed = cart.items[cartIndex];
         cart.items.splice(cartIndex, 1);
-        const product = yield product_1.default.findById(productId);
-        if (product) {
-            const variant = findVariant(product, variantId);
-            if (variant) {
-                variant.stock += removed.quantity;
-                yield product.save();
-            }
-        }
         yield cart.save();
-        return res.status(200).json({
-            message: "Item removed from cart",
-            cart,
-        });
+        const summary = yield enrichCartItems(cart.items);
+        return res.status(200).json(Object.assign({ message: "Item removed from cart", cart }, summary));
     }
     catch (error) {
         return res.status(500).json({
@@ -246,3 +265,86 @@ const remove_from_cart = (req, res) => __awaiter(void 0, void 0, void 0, functio
     }
 });
 exports.remove_from_cart = remove_from_cart;
+/**
+ * Checkout claims stock atomically per variant.
+ * If any claim fails (race / stale stock), previously claimed units are
+ * restored and the request fails with 409 — stock never goes negative.
+ */
+const checkout_cart = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const userId = req.userId;
+        const cart = yield cart_1.default.findOne({ userId });
+        if (!cart || cart.items.length === 0) {
+            return res.status(400).json({ message: "Your cart is empty" });
+        }
+        const summary = yield enrichCartItems(cart.items);
+        if (!summary.canCheckout) {
+            return res.status(409).json(Object.assign({ message: "Checkout blocked: some items are out of stock or no longer available. Update your cart and try again." }, summary));
+        }
+        const claimed = [];
+        const failures = [];
+        for (const item of summary.items) {
+            const updated = yield (0, stock_1.atomicDecrementStock)(String(item.productId), String(item.variantId), item.quantity);
+            if (!updated) {
+                failures.push({
+                    productId: String(item.productId),
+                    variantId: String(item.variantId),
+                    title: item.title,
+                    reason: "Insufficient stock at checkout",
+                });
+                break;
+            }
+            claimed.push({
+                productId: String(item.productId),
+                variantId: String(item.variantId),
+                qty: item.quantity,
+            });
+        }
+        if (failures.length > 0) {
+            for (const claim of claimed) {
+                yield (0, stock_1.atomicIncrementStock)(claim.productId, claim.variantId, claim.qty);
+            }
+            const refreshed = yield enrichCartItems(cart.items);
+            return res.status(409).json(Object.assign({ message: "Checkout failed: stock changed while you were checking out. Your cart was not charged.", failures }, refreshed));
+        }
+        const orderItems = summary.items.map((item) => ({
+            productId: item.productId,
+            variantId: item.variantId,
+            sku: item.sku,
+            title: item.title,
+            size: item.size,
+            colour: item.colour,
+            price: item.price,
+            quantity: item.quantity,
+            lineTotal: item.price * item.quantity,
+        }));
+        const order = yield order_1.default.create({
+            userId,
+            items: orderItems,
+            subtotal: summary.subtotal,
+            status: "paid",
+        });
+        cart.items = [];
+        yield cart.save();
+        return res.status(201).json({
+            message: "Checkout successful",
+            order: {
+                id: order._id,
+                subtotal: order.subtotal,
+                items: order.items,
+                status: order.status,
+                createdAt: order.createdAt,
+            },
+            items: [],
+            subtotal: 0,
+            canCheckout: false,
+        });
+    }
+    catch (error) {
+        return res.status(500).json({
+            message: "Checkout failed",
+            error: error instanceof Error ? error.message : error,
+        });
+    }
+});
+exports.checkout_cart = checkout_cart;
